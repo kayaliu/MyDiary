@@ -95,12 +95,51 @@ app.patch('/api/data/diaries/:date', (req, res) => {
 
 // ════════════════════════════════════════════════════════════════════════════
 //  AI PROXY  /api/ai/*
+//
+//  支持的 AI_PROVIDER:
+//    anthropic  — Anthropic Claude（原生格式）
+//    openai     — OpenAI GPT（OpenAI 兼容）
+//    deepseek   — DeepSeek（OpenAI 兼容）
+//    openrouter — OpenRouter 免费/付费模型（OpenAI 兼容）
+//    google     — Google Gemini（OpenAI 兼容端点）
+//    qianfan    — 百度千帆（OpenAI 兼容）
 // ════════════════════════════════════════════════════════════════════════════
+
+// OpenAI 兼容提供商配置表
+const OPENAI_COMPAT_PROVIDERS = {
+  openai: {
+    envKey: 'OPENAI_API_KEY',
+    base:   () => process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+    model:  () => process.env.OPENAI_MODEL    || 'gpt-4o',
+  },
+  deepseek: {
+    envKey: 'DEEPSEEK_API_KEY',
+    base:   () => 'https://api.deepseek.com/v1',
+    model:  () => process.env.DEEPSEEK_MODEL  || 'deepseek-chat',
+  },
+  openrouter: {
+    envKey: 'OPENROUTER_API_KEY',
+    base:   () => 'https://openrouter.ai/api/v1',
+    model:  () => process.env.OPENROUTER_MODEL || 'openrouter/auto',
+    extraHeaders: { 'HTTP-Referer': 'https://github.com/kayaliu/MyDiary', 'X-Title': 'MyDiary' },
+  },
+  google: {
+    envKey: 'GOOGLE_API_KEY',
+    base:   () => 'https://generativelanguage.googleapis.com/v1beta/openai',
+    model:  () => process.env.GOOGLE_MODEL    || 'gemini-1.5-flash',
+  },
+  qianfan: {
+    envKey: 'QIANFAN_API_KEY',
+    base:   () => process.env.QIANFAN_BASE_URL || 'https://qianfan.baidubce.com/v2',
+    model:  () => process.env.QIANFAN_MODEL   || 'deepseek-v3.2',
+  },
+}
+
 async function callAI({ messages, system, max_tokens = 2000 }) {
+  // ── Anthropic 原生格式 ────────────────────────────────────────────────────
   if (PROVIDER === 'anthropic') {
     if (!validKey('ANTHROPIC_API_KEY', 'sk-ant-xxx')) throw new Error('请在 .env 中设置有效的 ANTHROPIC_API_KEY')
-    const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5'
-    const body  = { model, max_tokens, messages }
+    const body = { model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5', max_tokens, messages }
     if (system) body.system = system
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -112,23 +151,22 @@ async function callAI({ messages, system, max_tokens = 2000 }) {
     return data.content?.[0]?.text || ''
   }
 
-  if (PROVIDER === 'openai' || PROVIDER === 'deepseek') {
-    const isDS   = PROVIDER === 'deepseek'
-    const apiKey = isDS ? process.env.DEEPSEEK_API_KEY : process.env.OPENAI_API_KEY
-    const base   = isDS ? 'https://api.deepseek.com/v1' : (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1')
-    const model  = isDS ? (process.env.DEEPSEEK_MODEL || 'deepseek-chat') : (process.env.OPENAI_MODEL || 'gpt-4o')
-    const msgs   = system ? [{ role: 'system', content: system }, ...messages] : messages
-    const r = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, max_tokens, messages: msgs }),
-    })
-    const data = await r.json()
-    if (!r.ok) throw new Error(data?.error?.message || 'API error')
-    return data.choices?.[0]?.message?.content || ''
-  }
+  // ── OpenAI 兼容格式 ───────────────────────────────────────────────────────
+  const cfg = OPENAI_COMPAT_PROVIDERS[PROVIDER]
+  if (!cfg) throw new Error(`未知 AI_PROVIDER: ${PROVIDER}。支持: anthropic, openai, deepseek, openrouter, google, qianfan`)
 
-  throw new Error(`未知 AI_PROVIDER: ${PROVIDER}`)
+  const apiKey = process.env[cfg.envKey]
+  if (!apiKey) throw new Error(`请在 .env 中设置 ${cfg.envKey}`)
+
+  const msgs = system ? [{ role: 'system', content: system }, ...messages] : messages
+  const r = await fetch(`${cfg.base()}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, ...(cfg.extraHeaders || {}) },
+    body: JSON.stringify({ model: cfg.model(), max_tokens, messages: msgs }),
+  })
+  const data = await r.json()
+  if (!r.ok) throw new Error(data?.error?.message || `${PROVIDER} API error`)
+  return data.choices?.[0]?.message?.content || ''
 }
 
 app.post('/api/ai/chat', async (req, res) => {
@@ -352,12 +390,15 @@ app.get('/api/health', (_req, res) => {
     provider: PROVIDER,
     storage: 'sqlite',
     configured: {
-      anthropic: validKey('ANTHROPIC_API_KEY', 'sk-ant-xxx'),
-      openai:    validKey('OPENAI_API_KEY',    'sk-xxx'),
-      deepseek:  validKey('DEEPSEEK_API_KEY',  'sk-xxx'),
-      siyuan:    validKey('SIYUAN_TOKEN',      'your-siyuan-token'),
-      feishu:    validKey('FEISHU_APP_ID',     'your-feishu-app-id'),
-      wecom:     validKey('WECOM_TOKEN',       'your-wecom-token'),
+      anthropic:   validKey('ANTHROPIC_API_KEY',  'sk-ant-xxx'),
+      openai:      validKey('OPENAI_API_KEY',      'sk-xxx'),
+      deepseek:    validKey('DEEPSEEK_API_KEY',    'sk-xxx'),
+      openrouter:  validKey('OPENROUTER_API_KEY',  'sk-or-xxx'),
+      google:      validKey('GOOGLE_API_KEY',      'AIza-xxx'),
+      qianfan:     validKey('QIANFAN_API_KEY',     'your-qianfan-key'),
+      siyuan:      validKey('SIYUAN_TOKEN',        'your-siyuan-token'),
+      feishu:      validKey('FEISHU_APP_ID',       'your-feishu-app-id'),
+      wecom:       validKey('WECOM_TOKEN',         'your-wecom-token'),
     },
     channels: {
       feishu: `http://your-domain:${PORT}/webhook/feishu`,
