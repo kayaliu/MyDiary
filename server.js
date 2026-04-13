@@ -1,10 +1,11 @@
 import express from 'express'
 import cors from 'cors'
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
+import { readFileSync, existsSync } from 'fs'
 import { createServer } from 'http'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import crypto from 'crypto'
+import { fragDB, extraDB, diaryDB } from './db.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -25,129 +26,99 @@ if (existsSync(join(__dirname, '.env'))) {
 const app      = express()
 const PORT     = parseInt(process.env.SERVER_PORT || process.env.PORT || '3001', 10)
 const PROVIDER = (process.env.AI_PROVIDER || 'anthropic').toLowerCase()
-const DATA_DIR = join(__dirname, 'data')
-mkdirSync(DATA_DIR, { recursive: true })
 
 app.use(cors())
 // Raw body needed for webhook signature verification
 app.use('/webhook', express.raw({ type: '*/*' }))
 app.use(express.json({ limit: '10mb' }))
 
-// ── Server-side file storage ─────────────────────────────────────────────────
-function readJSON(file, fallback = []) {
-  try { return JSON.parse(readFileSync(join(DATA_DIR, file), 'utf8')) } catch { return fallback }
-}
-function writeJSON(file, data) {
-  writeFileSync(join(DATA_DIR, file), JSON.stringify(data, null, 2))
-}
-function todayKey() { return new Date().toISOString().split('T')[0] }
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
+function todayKey() { return new Date().toISOString().split('T')[0] }
 function apiError(res, status, msg) { return res.status(status).json({ error: msg }) }
 function validKey(k, ph) { const v = process.env[k]; return !!v && v !== ph }
 
 // ════════════════════════════════════════════════════════════════════════════
 //  DATA API  /api/data/*
-//  Replaces localStorage — used by frontend and webhooks alike
 // ════════════════════════════════════════════════════════════════════════════
 
-// Fragments
+// ── Fragments ─────────────────────────────────────────────────────────────────
 app.get('/api/data/fragments/:date', (req, res) => {
-  res.json(readJSON(`fragments-${req.params.date}.json`))
+  res.json(fragDB.list(req.params.date))
 })
 
 app.post('/api/data/fragments', (req, res) => {
   const { date = todayKey(), content, type = 'text', source = 'web' } = req.body
   if (!content?.trim()) return apiError(res, 400, 'content 不能为空')
-  const file = `fragments-${date}.json`
-  const frags = readJSON(file)
-  const frag = { id: Date.now(), type, content: content.trim(), ts: Date.now(), source }
-  frags.push(frag)
-  writeJSON(file, frags)
-  res.json(frag)
+  res.json(fragDB.add(date, content, type, source))
 })
 
 app.delete('/api/data/fragments/:date/:id', (req, res) => {
-  const file = `fragments-${req.params.date}.json`
-  writeJSON(file, readJSON(file).filter(f => f.id !== parseInt(req.params.id)))
+  fragDB.remove(req.params.date, req.params.id)
   res.json({ ok: true })
 })
 
 app.delete('/api/data/fragments/:date', (req, res) => {
-  writeJSON(`fragments-${req.params.date}.json`, [])
+  fragDB.clear(req.params.date)
   res.json({ ok: true })
 })
 
-// Extra data (health, garmin, stock)
+// ── Extra data (health / garmin / stock) ──────────────────────────────────────
 app.get('/api/data/extra/:date', (req, res) => {
-  res.json(readJSON(`extra-${req.params.date}.json`, {}))
+  res.json(extraDB.get(req.params.date))
 })
 
 app.put('/api/data/extra/:date', (req, res) => {
-  const current = readJSON(`extra-${req.params.date}.json`, {})
-  const merged = { ...current, ...req.body }
-  writeJSON(`extra-${req.params.date}.json`, merged)
-  res.json(merged)
+  res.json(extraDB.set(req.params.date, req.body))
 })
 
-// Diaries
-app.get('/api/data/diaries', (req, res) => {
-  const files = readJSON('diary-index.json', [])
-  const diaries = {}
-  for (const date of files) {
-    const entry = readJSON(`diary-${date}.json`, null)
-    if (entry) diaries[date] = entry
-  }
-  res.json(diaries)
+// ── Diaries ───────────────────────────────────────────────────────────────────
+app.get('/api/data/diaries', (_req, res) => {
+  res.json(diaryDB.getAll())
 })
 
 app.get('/api/data/diaries/:date', (req, res) => {
-  const entry = readJSON(`diary-${req.params.date}.json`, null)
+  const entry = diaryDB.get(req.params.date)
   if (!entry) return apiError(res, 404, '日记不存在')
   res.json(entry)
 })
 
 app.put('/api/data/diaries/:date', (req, res) => {
-  const { date } = req.params
-  writeJSON(`diary-${date}.json`, req.body)
-  const idx = readJSON('diary-index.json', [])
-  if (!idx.includes(date)) { idx.push(date); idx.sort(); writeJSON('diary-index.json', idx) }
+  diaryDB.save(req.params.date, req.body)
   res.json({ ok: true })
 })
 
 app.patch('/api/data/diaries/:date', (req, res) => {
-  const file = `diary-${req.params.date}.json`
-  const entry = readJSON(file, null)
-  if (!entry) return apiError(res, 404, '日记不存在')
-  writeJSON(file, { ...entry, ...req.body })
+  const updated = diaryDB.patch(req.params.date, req.body)
+  if (!updated) return apiError(res, 404, '日记不存在')
   res.json({ ok: true })
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-//  AI PROXY  /api/ai/chat
+//  AI PROXY  /api/ai/*
 // ════════════════════════════════════════════════════════════════════════════
 async function callAI({ messages, system, max_tokens = 2000 }) {
   if (PROVIDER === 'anthropic') {
-    const apiKey = process.env.ANTHROPIC_API_KEY
     if (!validKey('ANTHROPIC_API_KEY', 'sk-ant-xxx')) throw new Error('请在 .env 中设置有效的 ANTHROPIC_API_KEY')
     const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5'
-    const body = { model, max_tokens, messages }
+    const body  = { model, max_tokens, messages }
     if (system) body.system = system
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify(body),
     })
     const data = await r.json()
     if (!r.ok) throw new Error(data?.error?.message || 'Anthropic API error')
     return data.content?.[0]?.text || ''
-  } else if (PROVIDER === 'openai' || PROVIDER === 'deepseek') {
-    const isDS = PROVIDER === 'deepseek'
+  }
+
+  if (PROVIDER === 'openai' || PROVIDER === 'deepseek') {
+    const isDS   = PROVIDER === 'deepseek'
     const apiKey = isDS ? process.env.DEEPSEEK_API_KEY : process.env.OPENAI_API_KEY
-    const baseUrl = isDS ? 'https://api.deepseek.com/v1' : (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1')
-    const model = isDS ? (process.env.DEEPSEEK_MODEL || 'deepseek-chat') : (process.env.OPENAI_MODEL || 'gpt-4o')
-    const msgs = system ? [{ role: 'system', content: system }, ...messages] : messages
-    const r = await fetch(`${baseUrl}/chat/completions`, {
+    const base   = isDS ? 'https://api.deepseek.com/v1' : (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1')
+    const model  = isDS ? (process.env.DEEPSEEK_MODEL || 'deepseek-chat') : (process.env.OPENAI_MODEL || 'gpt-4o')
+    const msgs   = system ? [{ role: 'system', content: system }, ...messages] : messages
+    const r = await fetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({ model, max_tokens, messages: msgs }),
@@ -156,13 +127,13 @@ async function callAI({ messages, system, max_tokens = 2000 }) {
     if (!r.ok) throw new Error(data?.error?.message || 'API error')
     return data.choices?.[0]?.message?.content || ''
   }
+
   throw new Error(`未知 AI_PROVIDER: ${PROVIDER}`)
 }
 
 app.post('/api/ai/chat', async (req, res) => {
   try {
-    const content = await callAI(req.body)
-    res.json({ content })
+    res.json({ content: await callAI(req.body) })
   } catch (e) {
     apiError(res, 500, e.message)
   }
@@ -174,47 +145,33 @@ app.post('/api/ai/chat', async (req, res) => {
 app.use('/api/siyuan', async (req, res) => {
   const base  = (process.env.SIYUAN_URL || 'http://127.0.0.1:6806').replace(/\/$/, '')
   const token = process.env.SIYUAN_TOKEN || ''
-  const url   = `${base}/api${req.path}`
   try {
-    const r = await fetch(url, {
+    const r = await fetch(`${base}/api${req.path}`, {
       method:  req.method,
       headers: { 'Content-Type': 'application/json', 'Authorization': `Token ${token}` },
       body:    req.method !== 'GET' ? JSON.stringify(req.body) : undefined,
     })
     res.json(await r.json())
   } catch (e) {
-    const isConnErr = e.message.includes('ECONNREFUSED') || e.message.includes('fetch failed')
-    res.status(isConnErr ? 503 : 502).json({
-      error: isConnErr ? '无法连接思源笔记，请确认已启动' : e.message,
-    })
+    const connErr = e.message.includes('ECONNREFUSED') || e.message.includes('fetch failed')
+    res.status(connErr ? 503 : 502).json({ error: connErr ? '无法连接思源笔记，请确认已启动' : e.message })
   }
 })
 
 // ════════════════════════════════════════════════════════════════════════════
 //  WEBHOOK: FEISHU (飞书)
-//  配置步骤:
-//  1. 在飞书开放平台创建自建应用
-//  2. 添加事件订阅 → im.message.receive_v1
-//  3. 请求 URL 设置为 https://your-domain/webhook/feishu
-//  4. 在 .env 中设置 FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_VERIFY_TOKEN
 // ════════════════════════════════════════════════════════════════════════════
 app.post('/webhook/feishu', async (req, res) => {
-  const body = req.body.toString()
   let payload
-  try { payload = JSON.parse(body) } catch { return apiError(res, 400, 'invalid JSON') }
+  try { payload = JSON.parse(req.body.toString()) } catch { return apiError(res, 400, 'invalid JSON') }
 
-  // Step 1: URL verification challenge
-  if (payload.challenge) {
-    return res.json({ challenge: payload.challenge })
-  }
+  // URL verification challenge
+  if (payload.challenge) return res.json({ challenge: payload.challenge })
 
-  // Step 2: Verify token (basic security)
+  // Token verification
   const verifyToken = process.env.FEISHU_VERIFY_TOKEN
-  if (verifyToken && payload.header?.token !== verifyToken) {
-    return apiError(res, 401, 'invalid token')
-  }
+  if (verifyToken && payload.header?.token !== verifyToken) return apiError(res, 401, 'invalid token')
 
-  // Step 3: Handle message events
   if (payload.header?.event_type === 'im.message.receive_v1') {
     const msg = payload.event?.message
     if (!msg || msg.message_type !== 'text') return res.json({ ok: true })
@@ -226,19 +183,18 @@ app.post('/webhook/feishu', async (req, res) => {
     const date = todayKey()
 
     if (text.includes('总结日记')) {
-      // Trigger diary generation
-      res.json({ ok: true }) // respond immediately to Feishu
+      res.json({ ok: true })
       await generateAndSendDiary(date, 'feishu', payload.event)
     } else if (text === '查看日记') {
-      const diary = readJSON(`diary-${date}.json`, null)
-      await sendFeishuReply(payload.event, diary ? `📖 今日日记已生成，请在 MyDiary App 中查看` : `📝 今日还未生成日记，继续记录碎片后说"总结日记"`)
+      const diary = diaryDB.get(date)
+      await sendFeishuReply(payload.event, diary
+        ? '📖 今日日记已生成，请在 MyDiary App 中查看'
+        : '📝 今日还未生成日记，继续记录碎片后说"总结日记"')
       res.json({ ok: true })
     } else {
-      // Save as fragment
-      const frags = readJSON(`fragments-${date}.json`)
-      frags.push({ id: Date.now(), type: 'feishu', content: text, ts: Date.now(), source: 'feishu' })
-      writeJSON(`fragments-${date}.json`, frags)
-      await sendFeishuReply(payload.event, `👂 收到～（今日第 ${frags.length} 条）`)
+      const frag = fragDB.add(date, text, 'text', 'feishu')
+      const count = fragDB.list(date).length
+      await sendFeishuReply(payload.event, `👂 收到～（今日第 ${count} 条）`)
       res.json({ ok: true })
     }
   } else {
@@ -252,14 +208,13 @@ async function getFeishuToken() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ app_id: process.env.FEISHU_APP_ID, app_secret: process.env.FEISHU_APP_SECRET }),
   })
-  const data = await r.json()
-  return data.tenant_access_token
+  return (await r.json()).tenant_access_token
 }
 
 async function sendFeishuReply(event, text) {
   if (!process.env.FEISHU_APP_ID || !process.env.FEISHU_APP_SECRET) return
   try {
-    const token = await getFeishuToken()
+    const token  = await getFeishuToken()
     const chatId = event.message?.chat_id
     await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
       method: 'POST',
@@ -271,27 +226,17 @@ async function sendFeishuReply(event, text) {
 
 // ════════════════════════════════════════════════════════════════════════════
 //  WEBHOOK: WECOM (企业微信)
-//  配置步骤:
-//  1. 企业微信管理后台 → 自建应用 → 接收消息
-//  2. URL 设置为 https://your-domain/webhook/wecom
-//  3. 在 .env 中设置 WECOM_TOKEN, WECOM_ENCODING_AES_KEY, WECOM_CORP_ID
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/webhook/wecom', (req, res) => {
-  // WeCom URL verification (GET request)
   const { msg_signature, timestamp, nonce, echostr } = req.query
-  const wecomToken = process.env.WECOM_TOKEN || ''
-  const str = [wecomToken, timestamp, nonce].sort().join('')
+  const str = [process.env.WECOM_TOKEN || '', timestamp, nonce].sort().join('')
   const sig = crypto.createHash('sha1').update(str).digest('hex')
   if (sig === msg_signature) res.send(echostr)
   else apiError(res, 403, 'signature mismatch')
 })
 
 app.post('/webhook/wecom', async (req, res) => {
-  // WeCom message handling (simplified — use wecom-crypto for full AES decrypt in production)
-  const body = req.body.toString()
-  // Parse XML: <Content>...</Content>
-  const contentMatch = body.match(/<Content><!\[CDATA\[(.+?)\]\]><\/Content>/)
-  const text = contentMatch?.[1]?.trim()
+  const text = req.body.toString().match(/<Content><!\[CDATA\[(.+?)\]\]><\/Content>/)?.[1]?.trim()
   if (!text) return res.send('<xml><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[ok]]></Content></xml>')
 
   const date = todayKey()
@@ -299,15 +244,14 @@ app.post('/webhook/wecom', async (req, res) => {
     res.send('<xml><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[生成中，请稍候...]]></Content></xml>')
     await generateAndSendDiary(date, 'wecom', null)
   } else {
-    const frags = readJSON(`fragments-${date}.json`)
-    frags.push({ id: Date.now(), type: 'wecom', content: text, ts: Date.now(), source: 'wecom' })
-    writeJSON(`fragments-${date}.json`, frags)
-    res.send(`<xml><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[👂 收到～（今日第 ${frags.length} 条）]]></Content></xml>`)
+    fragDB.add(date, text, 'text', 'wecom')
+    const count = fragDB.list(date).length
+    res.send(`<xml><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[👂 收到～（今日第 ${count} 条）]]></Content></xml>`)
   }
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-//  DIARY GENERATION (shared by webhooks and web UI)
+//  DIARY GENERATION
 // ════════════════════════════════════════════════════════════════════════════
 const WEEKDAYS = ['日','一','二','三','四','五','六']
 function getDateLabel(dateStr) {
@@ -316,8 +260,8 @@ function getDateLabel(dateStr) {
 }
 
 async function generateAndSendDiary(date, channel = 'web', eventCtx = null) {
-  const frags = readJSON(`fragments-${date}.json`)
-  const extra = readJSON(`extra-${date}.json`, {})
+  const frags     = fragDB.list(date)
+  const extra     = extraDB.get(date)
   const dateLabel = getDateLabel(date)
 
   const fragText = frags.length > 0
@@ -377,13 +321,10 @@ async function generateAndSendDiary(date, channel = 'web', eventCtx = null) {
     })
 
     const entry = { date, dateLabel, content, fragments: frags, generatedAt: Date.now() }
-    writeJSON(`diary-${date}.json`, entry)
-    const idx = readJSON('diary-index.json', [])
-    if (!idx.includes(date)) { idx.push(date); idx.sort(); writeJSON('diary-index.json', idx) }
+    diaryDB.save(date, entry)
 
-    // Send result back to channel
     if (channel === 'feishu' && eventCtx) {
-      const summary = content.split('\n').find(l => l.includes('一句话总结'))
+      const summary = content.includes('一句话总结')
         ? content.slice(content.indexOf('一句话总结'))
         : content.slice(0, 300) + '...'
       await sendFeishuReply(eventCtx, `📖 今日日记已生成 ✦\n\n${summary}\n\n完整日记请在 MyDiary App 中查看`)
@@ -391,28 +332,25 @@ async function generateAndSendDiary(date, channel = 'web', eventCtx = null) {
     return entry
   } catch (e) {
     console.error('Diary generation error:', e.message)
-    if (channel === 'feishu' && eventCtx) {
-      await sendFeishuReply(eventCtx, `生成失败：${e.message}`)
-    }
+    if (channel === 'feishu' && eventCtx) await sendFeishuReply(eventCtx, `生成失败：${e.message}`)
     return null
   }
 }
 
-// Also expose diary generation as REST endpoint (for frontend button)
 app.post('/api/ai/generate-diary', async (req, res) => {
-  const { date = todayKey() } = req.body
-  const entry = await generateAndSendDiary(date, 'web')
+  const entry = await generateAndSendDiary(req.body.date || todayKey(), 'web')
   if (entry) res.json(entry)
   else apiError(res, 500, 'Diary generation failed — check server logs')
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-//  HEALTH CHECK  /api/health
+//  HEALTH CHECK
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
     provider: PROVIDER,
+    storage: 'sqlite',
     configured: {
       anthropic: validKey('ANTHROPIC_API_KEY', 'sk-ant-xxx'),
       openai:    validKey('OPENAI_API_KEY',    'sk-xxx'),
@@ -422,8 +360,8 @@ app.get('/api/health', (_req, res) => {
       wecom:     validKey('WECOM_TOKEN',       'your-wecom-token'),
     },
     channels: {
-      feishu: `${process.env.SERVER_PORT ? `http://your-domain:${PORT}` : `http://your-domain`}/webhook/feishu`,
-      wecom:  `${process.env.SERVER_PORT ? `http://your-domain:${PORT}` : `http://your-domain`}/webhook/wecom`,
+      feishu: `http://your-domain:${PORT}/webhook/feishu`,
+      wecom:  `http://your-domain:${PORT}/webhook/wecom`,
     }
   })
 })
@@ -439,8 +377,8 @@ if (process.env.NODE_ENV === 'production') {
 createServer(app).listen(PORT, () => {
   console.log(`\n🚀 MyDiary server  →  http://localhost:${PORT}`)
   console.log(`   AI provider : ${PROVIDER}  ${validKey('ANTHROPIC_API_KEY','sk-ant-xxx') || validKey('OPENAI_API_KEY','sk-xxx') || validKey('DEEPSEEK_API_KEY','sk-xxx') ? '✅' : '⚠️  需配置 API Key'}`)
+  console.log(`   Storage     : SQLite  (data/diary.db)`)
   console.log(`   SiYuan      : ${process.env.SIYUAN_URL || 'http://127.0.0.1:6806'}`)
   console.log(`   飞书 Webhook: http://your-domain:${PORT}/webhook/feishu`)
-  console.log(`   企业微信    : http://your-domain:${PORT}/webhook/wecom`)
-  console.log(`   数据目录    : ${DATA_DIR}\n`)
+  console.log(`   企业微信    : http://your-domain:${PORT}/webhook/wecom\n`)
 })
