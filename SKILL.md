@@ -1,171 +1,125 @@
 ---
-name: voice-diary
-description: 语音日记技能。当用户提到"语音日记"、"记录日记"、"语音记录"、"总结日记"、"日记助手"、"帮我记一下"、"今天发生了"、或希望用碎片时间积累片段并生成结构化日记时，必须触发此技能。支持全天断续输入（语音/文字/图片），说"总结日记"时自动汇总为规范日记格式，并支持按周/月/季复盘。
+name: voice_diary
+description: "日记助手：记录每日碎片并用 AI 生成结构化日记。当用户说想记录想法、今天发生的事、帮我记一下、总结日记、看日记、做复盘时触发。调用本地 MyDiary 服务（默认 http://localhost:3001）的 REST API 完成操作。"
+metadata: {"clawdbot":{"os":["darwin","linux"],"requires":{"bins":["node","curl"]}}}
 ---
 
-# 语音日记助手 (MyDiary) — 操作指南
+# 语音日记助手 (MyDiary)
 
-MyDiary 是一个运行在本地的日记服务（默认 `http://localhost:3001`）。  
-作为 AI agent，你通过 REST API 直接操作数据，无需用户手动打开浏览器。
+调用运行在本地的 MyDiary 服务记录日记碎片、生成日记和周期复盘。
+
+服务地址从配置读取：`MYDIARY_SERVER_URL`（默认 `http://localhost:3001`）。
 
 ---
 
 ## 第一步：确认服务状态
 
-每次被触发时，先检查服务是否在运行：
+每次被触发时先检查：
 
 ```bash
-curl -s http://localhost:3001/api/health
+curl -s ${MYDIARY_SERVER_URL:-http://localhost:3001}/api/health
 ```
 
-- 若返回 `{"ok":true,...}`：服务正常，继续操作
-- 若连接失败：提示用户先启动服务：
-  ```bash
-  cd /Users/kayaliu/Documents/Workspace/MyDiary
-  npm run dev   # 开发模式
-  # 或
-  npm run preview   # 生产模式
-  ```
+- 返回 `{"ok":true}` → 继续操作
+- 连接失败 → 告知用户启动服务：
+
+```bash
+cd ~/Documents/Workspace/MyDiary && npm run preview
+```
 
 ---
 
-## 核心操作
+## 操作指令
 
 ### 记录一条碎片
 
-用户说了什么想记下来的内容，调用：
+用户说了想记录的内容时：
 
 ```bash
-curl -s -X POST http://localhost:3001/api/data/fragments \
+curl -s -X POST ${MYDIARY_SERVER_URL:-http://localhost:3001}/api/data/fragments \
   -H "Content-Type: application/json" \
-  -d '{"content": "用户说的内容", "type": "text"}'
+  -d "{\"content\": \"用户说的内容\", \"type\": \"text\", \"source\": \"openclaw\"}"
 ```
 
-`type` 可以是 `text`（文字）、`voice`（语音转写）、`image`（图片描述）。
-
-成功后回复用户：**"✓ 已记录"**，简短确认，不展开分析。
+成功后只回复：**✓ 已记录**，不展开分析。
 
 ---
 
-### 查看今日已记录的碎片
+### 查看今日碎片
 
 ```bash
-DATE=$(date +%Y-%m-%d)
-curl -s http://localhost:3001/api/data/fragments/$DATE
+curl -s ${MYDIARY_SERVER_URL:-http://localhost:3001}/api/data/fragments/$(date +%Y-%m-%d)
 ```
-
-以友好格式展示给用户，例如：
-> 今日已记录 3 条：
-> 1. [文字] 今天终于把报告改完了
-> 2. [文字] 午饭吃了烤鸭
-> 3. [文字] 突然想到一个好主意
 
 ---
 
-### 生成今日日记（用户说"总结日记"时触发）
+### 生成今日日记（用户说"总结日记"时）
 
 ```bash
-curl -s -X POST http://localhost:3001/api/ai/generate-diary \
+curl -s -X POST ${MYDIARY_SERVER_URL:-http://localhost:3001}/api/ai/generate-diary \
   -H "Content-Type: application/json" \
-  -d '{"date": "'$(date +%Y-%m-%d)'"}'
+  -d "{\"date\": \"$(date +%Y-%m-%d)\"}"
 ```
 
-将生成的日记内容完整展示给用户。
+将返回的 `content` 字段完整展示给用户。
 
 ---
 
-### 查看历史日记列表
+### 查看历史日记
 
 ```bash
-curl -s http://localhost:3001/api/data/diaries
+curl -s ${MYDIARY_SERVER_URL:-http://localhost:3001}/api/data/diaries
 ```
 
-按日期倒序列出，让用户选择查看某一天。
+按日期列出，让用户选择查看某天。
 
 ---
 
-### 查看某天的日记
+### 查看某天日记
 
 ```bash
-curl -s http://localhost:3001/api/data/diaries/2026-04-13
-```
-
----
-
-### 删除一条碎片
-
-```bash
-curl -s -X DELETE http://localhost:3001/api/data/fragments/2026-04-13/1744517823000
+curl -s ${MYDIARY_SERVER_URL:-http://localhost:3001}/api/data/diaries/YYYY-MM-DD
 ```
 
 ---
 
-### 清空今日碎片
+### 生成复盘（本周 / 本月 / 本季度）
+
+1. 获取所有日记：`GET /api/data/diaries`
+2. 按用户指定周期筛选
+3. 拼接日记内容，调用 AI 生成复盘报告：
 
 ```bash
-curl -s -X DELETE http://localhost:3001/api/data/fragments/$(date +%Y-%m-%d)
-```
-
----
-
-### 生成周期复盘
-
-获取所有日记后，根据用户指定的周期（本周/本月/本季度）筛选内容，  
-调用 AI 进行复盘分析：
-
-```bash
-curl -s http://localhost:3001/api/data/diaries
-```
-
-筛选日记后，通过 `/api/ai/chat` 发送复盘 prompt：
-
-```bash
-curl -s -X POST http://localhost:3001/api/ai/chat \
+curl -s -X POST ${MYDIARY_SERVER_URL:-http://localhost:3001}/api/ai/chat \
   -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role":"user","content":"请对以下日记生成本周复盘报告：\n\n[日记内容]"}],
-    "max_tokens": 2000
-  }'
+  -d "{\"messages\":[{\"role\":\"user\",\"content\":\"请对以下日记生成复盘报告：\n\n[日记内容]\"}],\"max_tokens\":2000}"
 ```
 
 ---
 
-## 行为准则
+## 行为规则
 
-| 场景 | 行为 |
-|------|------|
-| 用户发来一段话/想法 | 静默调用 API 记录，回复"✓ 已记录"，不展开分析 |
-| 用户说"总结日记" | 调用生成接口，完整展示日记 |
-| 用户说"看看今天记了什么" | 调用 fragments API，列出当日记录 |
-| 用户说"查看日记" / "看日记" | 调用 diaries API，列出日记列表 |
-| 用户说"做个复盘" | 询问周期（本周/本月/本季度），然后生成复盘 |
-| 服务未启动 | 提示启动命令，不尝试其他方案 |
-
----
-
-## 服务地址配置
-
-默认地址：`http://localhost:3001`
-
-如果用户修改了 `SERVER_PORT`，服务地址相应变化。  
-可通过 `.env` 中的 `SERVER_PORT` 确认。
+| 用户输入 | 行为 |
+|----------|------|
+| 任意想法 / 事件 | POST fragment，回复"✓ 已记录" |
+| 总结日记 | POST generate-diary，展示全文 |
+| 查看今天 / 记了什么 | GET fragments，列出清单 |
+| 看日记 / 历史 | GET diaries，列出日期 |
+| 复盘 | 询问周期，生成报告 |
+| 服务未启动 | 告知启动命令，不做其他尝试 |
 
 ---
 
-## 完整 API 参考
+## API 速查
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/health` | 服务状态检查 |
+| GET | `/api/health` | 健康检查 |
 | GET | `/api/data/fragments/:date` | 获取某日碎片 |
-| POST | `/api/data/fragments` | 添加碎片 `{date?,content,type?,source?}` |
-| DELETE | `/api/data/fragments/:date/:id` | 删除单条 |
-| DELETE | `/api/data/fragments/:date` | 清空某日 |
-| GET | `/api/data/extra/:date` | 健康/运动/投资数据 |
-| PUT | `/api/data/extra/:date` | 保存额外数据 |
+| POST | `/api/data/fragments` | 添加碎片 `{content, type?, date?, source?}` |
+| DELETE | `/api/data/fragments/:date/:id` | 删除单条碎片 |
+| DELETE | `/api/data/fragments/:date` | 清空某日碎片 |
 | GET | `/api/data/diaries` | 所有日记 |
 | GET | `/api/data/diaries/:date` | 单篇日记 |
-| PUT | `/api/data/diaries/:date` | 保存日记 |
-| PATCH | `/api/data/diaries/:date` | 部分更新 |
-| POST | `/api/ai/chat` | AI 对话代理 |
-| POST | `/api/ai/generate-diary` | 生成今日日记 `{date?}` |
+| POST | `/api/ai/generate-diary` | 生成日记 `{date?}` |
+| POST | `/api/ai/chat` | AI 对话 `{messages, system?, max_tokens?}` |
