@@ -1,117 +1,171 @@
-# MyDiary — 语音日记 AI Mini App
+---
+name: voice-diary
+description: 语音日记技能。当用户提到"语音日记"、"记录日记"、"语音记录"、"总结日记"、"日记助手"、"帮我记一下"、"今天发生了"、或希望用碎片时间积累片段并生成结构化日记时，必须触发此技能。支持全天断续输入（语音/文字/图片），说"总结日记"时自动汇总为规范日记格式，并支持按周/月/季复盘。
+---
 
-一个运行在本地的语音日记 Web 应用。利用碎片时间积累语音/文字/图片片段，AI 汇总生成结构化日记，并一键同步到思源笔记，支持周/月/季复盘。
+# 语音日记助手 (MyDiary) — 操作指南
+
+MyDiary 是一个运行在本地的日记服务（默认 `http://localhost:3001`）。  
+作为 AI agent，你通过 REST API 直接操作数据，无需用户手动打开浏览器。
 
 ---
 
-## 项目结构
+## 第一步：确认服务状态
 
-```
-MyDiary/
-├── server.js          # Express 后端（AI 代理 + 思源笔记代理）
-├── src/
-│   ├── main.jsx       # React 入口
-│   └── App.jsx        # 主应用（全部 UI 逻辑）
-├── index.html
-├── vite.config.js
-├── package.json
-├── .env               # 你的配置（从 .env.example 复制）
-└── .env.example       # 配置模板
-```
-
----
-
-## 快速开始
-
-### 1. 安装依赖
+每次被触发时，先检查服务是否在运行：
 
 ```bash
-cd MyDiary
-npm install
+curl -s http://localhost:3001/api/health
 ```
 
-### 2. 配置环境变量
+- 若返回 `{"ok":true,...}`：服务正常，继续操作
+- 若连接失败：提示用户先启动服务：
+  ```bash
+  cd /Users/kayaliu/Documents/Workspace/MyDiary
+  npm run dev   # 开发模式
+  # 或
+  npm run preview   # 生产模式
+  ```
+
+---
+
+## 核心操作
+
+### 记录一条碎片
+
+用户说了什么想记下来的内容，调用：
 
 ```bash
-cp .env.example .env
+curl -s -X POST http://localhost:3001/api/data/fragments \
+  -H "Content-Type: application/json" \
+  -d '{"content": "用户说的内容", "type": "text"}'
 ```
 
-编辑 `.env`，至少填入一个 AI Key：
+`type` 可以是 `text`（文字）、`voice`（语音转写）、`image`（图片描述）。
 
-```env
-AI_PROVIDER=anthropic           # 或 openai / deepseek
-ANTHROPIC_API_KEY=sk-ant-xxx
+成功后回复用户：**"✓ 已记录"**，简短确认，不展开分析。
 
-SIYUAN_TOKEN=your-token         # 从思源「设置-关于」复制
-SIYUAN_NOTEBOOK_ID=             # 可选，也可在 App 内选择
-```
+---
 
-### 3. 启动
+### 查看今日已记录的碎片
 
 ```bash
-npm run dev
+DATE=$(date +%Y-%m-%d)
+curl -s http://localhost:3001/api/data/fragments/$DATE
 ```
 
-打开 http://localhost:5173 即可使用。
+以友好格式展示给用户，例如：
+> 今日已记录 3 条：
+> 1. [文字] 今天终于把报告改完了
+> 2. [文字] 午饭吃了烤鸭
+> 3. [文字] 突然想到一个好主意
 
 ---
 
-## 功能说明
+### 生成今日日记（用户说"总结日记"时触发）
 
-### 记录 Tab
-- **语音输入**：按住麦克风说话；说"总结日记"直接触发生成
-- **文字输入**：打字记录，⌘+Enter 快速提交
-- **图片上传**：截图/照片记录到当日碎片
-- **Apple健康**：手动输入 或 JSON 导入（配合 Health Auto Export App）
-- **Garmin**：手动输入运动数据（待官方 API 授权后可自动化）
-- **投资数据**：手动输入同花顺等平台数据
+```bash
+curl -s -X POST http://localhost:3001/api/ai/generate-diary \
+  -H "Content-Type: application/json" \
+  -d '{"date": "'$(date +%Y-%m-%d)'"}'
+```
 
-### 日记 Tab
-- 查看历史所有日记（按日期倒序）
-- 一键复制 Markdown
-- 一键同步到思源笔记（需配置 Token）
-
-### 复盘 Tab
-- 按本周/本月/本季度筛选日记
-- AI 生成深度复盘报告
+将生成的日记内容完整展示给用户。
 
 ---
 
-## 支持的 AI 提供商
+### 查看历史日记列表
 
-| 提供商 | .env 设置 | 说明 |
-|--------|-----------|------|
-| Anthropic Claude | `AI_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | 默认，推荐 |
-| OpenAI / 兼容API | `AI_PROVIDER=openai` + `OPENAI_API_KEY` | 支持自定义 base URL |
-| DeepSeek | `AI_PROVIDER=deepseek` + `DEEPSEEK_API_KEY` | 低成本选项 |
+```bash
+curl -s http://localhost:3001/api/data/diaries
+```
 
----
-
-## 思源笔记配置
-
-1. 打开思源笔记 → 设置 → 关于 → 复制 API Token
-2. 填入 `.env` 的 `SIYUAN_TOKEN`
-3. App 右上角 📓 图标 → 选择笔记本
-4. 日记将保存到 `笔记本/日记/YYYY-MM-DD`
+按日期倒序列出，让用户选择查看某一天。
 
 ---
 
-## 第三方数据集成说明
+### 查看某天的日记
 
-| 来源 | 状态 | 方案 |
+```bash
+curl -s http://localhost:3001/api/data/diaries/2026-04-13
+```
+
+---
+
+### 删除一条碎片
+
+```bash
+curl -s -X DELETE http://localhost:3001/api/data/fragments/2026-04-13/1744517823000
+```
+
+---
+
+### 清空今日碎片
+
+```bash
+curl -s -X DELETE http://localhost:3001/api/data/fragments/$(date +%Y-%m-%d)
+```
+
+---
+
+### 生成周期复盘
+
+获取所有日记后，根据用户指定的周期（本周/本月/本季度）筛选内容，  
+调用 AI 进行复盘分析：
+
+```bash
+curl -s http://localhost:3001/api/data/diaries
+```
+
+筛选日记后，通过 `/api/ai/chat` 发送复盘 prompt：
+
+```bash
+curl -s -X POST http://localhost:3001/api/ai/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role":"user","content":"请对以下日记生成本周复盘报告：\n\n[日记内容]"}],
+    "max_tokens": 2000
+  }'
+```
+
+---
+
+## 行为准则
+
+| 场景 | 行为 |
+|------|------|
+| 用户发来一段话/想法 | 静默调用 API 记录，回复"✓ 已记录"，不展开分析 |
+| 用户说"总结日记" | 调用生成接口，完整展示日记 |
+| 用户说"看看今天记了什么" | 调用 fragments API，列出当日记录 |
+| 用户说"查看日记" / "看日记" | 调用 diaries API，列出日记列表 |
+| 用户说"做个复盘" | 询问周期（本周/本月/本季度），然后生成复盘 |
+| 服务未启动 | 提示启动命令，不尝试其他方案 |
+
+---
+
+## 服务地址配置
+
+默认地址：`http://localhost:3001`
+
+如果用户修改了 `SERVER_PORT`，服务地址相应变化。  
+可通过 `.env` 中的 `SERVER_PORT` 确认。
+
+---
+
+## 完整 API 参考
+
+| 方法 | 路径 | 说明 |
 |------|------|------|
-| Apple健康 | ✅ 支持 | 手动输入 或 Health Auto Export JSON |
-| Garmin | ✅ 手动支持 | 手动输入；官方 API 需开发者账号 |
-| 同花顺/股票 | ✅ 手动支持 | 手动输入；无公开 API |
-| 思源笔记 | ✅ 全自动 | 本地 REST API 直接集成 |
-
----
-
-## 生产部署
-
-```bash
-npm run build        # 构建前端
-NODE_ENV=production node server.js   # 启动生产服务
-```
-
-访问 http://localhost:3001
+| GET | `/api/health` | 服务状态检查 |
+| GET | `/api/data/fragments/:date` | 获取某日碎片 |
+| POST | `/api/data/fragments` | 添加碎片 `{date?,content,type?,source?}` |
+| DELETE | `/api/data/fragments/:date/:id` | 删除单条 |
+| DELETE | `/api/data/fragments/:date` | 清空某日 |
+| GET | `/api/data/extra/:date` | 健康/运动/投资数据 |
+| PUT | `/api/data/extra/:date` | 保存额外数据 |
+| GET | `/api/data/diaries` | 所有日记 |
+| GET | `/api/data/diaries/:date` | 单篇日记 |
+| PUT | `/api/data/diaries/:date` | 保存日记 |
+| PATCH | `/api/data/diaries/:date` | 部分更新 |
+| POST | `/api/ai/chat` | AI 对话代理 |
+| POST | `/api/ai/generate-diary` | 生成今日日记 `{date?}` |
