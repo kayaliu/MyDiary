@@ -211,14 +211,35 @@ app.post('/webhook/feishu', async (req, res) => {
   if (verifyToken && payload.header?.token !== verifyToken) return apiError(res, 401, 'invalid token')
 
   if (payload.header?.event_type === 'im.message.receive_v1') {
-    const msg = payload.event?.message
-    if (!msg || msg.message_type !== 'text') return res.json({ ok: true })
+    const msg  = payload.event?.message
+    const date = todayKey()
+    if (!msg) return res.json({ ok: true })
+
+    // ── 语音消息：下载 + Whisper 转写 ────────────────────────────────────────
+    if (msg.message_type === 'audio') {
+      res.json({ ok: true })
+      await handleFeishuAudio(msg, payload.event, date)
+      return
+    }
+
+    // ── 图片消息 ──────────────────────────────────────────────────────────────
+    if (msg.message_type === 'image') {
+      const imageKey = (() => { try { return JSON.parse(msg.content).image_key } catch { return null } })()
+      if (imageKey) {
+        fragDB.add(date, `[飞书图片: ${imageKey}]`, 'image', 'feishu')
+        const count = fragDB.list(date).length
+        await sendFeishuReply(payload.event, `📷 图片已记录（今日第 ${count} 条）`)
+      }
+      res.json({ ok: true })
+      return
+    }
+
+    // ── 文本消息 ──────────────────────────────────────────────────────────────
+    if (msg.message_type !== 'text') return res.json({ ok: true })
 
     let text = ''
     try { text = JSON.parse(msg.content).text?.trim() } catch {}
     if (!text) return res.json({ ok: true })
-
-    const date = todayKey()
 
     if (text.includes('总结日记')) {
       res.json({ ok: true })
@@ -230,7 +251,7 @@ app.post('/webhook/feishu', async (req, res) => {
         : '📝 今日还未生成日记，继续记录碎片后说"总结日记"')
       res.json({ ok: true })
     } else {
-      const frag = fragDB.add(date, text, 'text', 'feishu')
+      fragDB.add(date, text, 'text', 'feishu')
       const count = fragDB.list(date).length
       await sendFeishuReply(payload.event, `👂 收到～（今日第 ${count} 条）`)
       res.json({ ok: true })
@@ -260,6 +281,51 @@ async function sendFeishuReply(event, text) {
       body: JSON.stringify({ receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) }),
     })
   } catch (e) { console.error('Feishu reply error:', e.message) }
+}
+
+async function handleFeishuAudio(msg, event, date) {
+  try {
+    const fileKey = (() => { try { return JSON.parse(msg.content).file_key } catch { return null } })()
+    if (!fileKey) throw new Error('音频消息缺少 file_key')
+
+    const token = await getFeishuToken()
+    const audioRes = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/messages/${msg.message_id}/resources/${fileKey}?type=file`,
+      { headers: { 'Authorization': `Bearer ${token}` } }
+    )
+    if (!audioRes.ok) throw new Error(`音频下载失败 (${audioRes.status})`)
+    const audioBuffer = await audioRes.arrayBuffer()
+
+    if (!validKey('OPENAI_API_KEY', 'sk-xxx')) {
+      await sendFeishuReply(event, '🎤 收到语音，但未配置语音转写服务（需在 .env 中设置有效的 OPENAI_API_KEY）。请直接发文字记录。')
+      return
+    }
+
+    const form = new FormData()
+    form.append('file', new Blob([audioBuffer], { type: 'audio/ogg' }), 'audio.ogg')
+    form.append('model', 'whisper-1')
+    form.append('language', 'zh')
+    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: form,
+    })
+    const whisperData = await whisperRes.json()
+    if (!whisperRes.ok) throw new Error(whisperData.error?.message || 'Whisper 转写失败')
+    const text = (whisperData.text || '').trim()
+    if (!text) throw new Error('转写结果为空')
+
+    if (text.includes('总结日记') || text.includes('生成日记')) {
+      await generateAndSendDiary(date, 'feishu', event)
+    } else {
+      fragDB.add(date, text, 'voice', 'feishu')
+      const count = fragDB.list(date).length
+      await sendFeishuReply(event, `🎤 语音已转文字并记录（今日第 ${count} 条）：\n"${text}"`)
+    }
+  } catch (e) {
+    console.error('Feishu audio error:', e.message)
+    await sendFeishuReply(event, `🎤 语音处理失败：${e.message}。请直接发文字。`)
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
