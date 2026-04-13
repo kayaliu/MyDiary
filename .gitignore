@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment variables (contains secrets)
+.env
+
+# Build output
+dist/
+
+# Data directory (personal diary entries, not for version control)
+data/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Original draft file
+voice-diary-app_1.jsx
