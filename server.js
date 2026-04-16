@@ -239,7 +239,7 @@ app.post('/api/media/describe', async (req, res) => {
       : 'https://api.openai.com/v1/chat/completions'
     // 选择支持 vision 的模型
     const model = isOpenRouter
-      ? (process.env.OPENROUTER_VISION_MODEL || 'qwen/qwen2.5-vl-72b-instruct:free')
+      ? (process.env.OPENROUTER_VISION_MODEL || 'nvidia/nemotron-nano-12b-v2-vl:free')
       : (process.env.OPENAI_MODEL || 'gpt-4o')
 
     const headers = {
@@ -252,19 +252,23 @@ app.post('/api/media/describe', async (req, res) => {
       headers,
       body: JSON.stringify({
         model,
-        max_tokens: 300,
+        max_tokens: 800,
         messages: [{
           role: 'user',
           content: [
             { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } },
-            { type: 'text', text: '请用中文简短描述这张图片的内容，一两句话即可，突出重点信息。' }
+            { type: 'text', text: '请用中文简短描述这张图片的内容，一两句话即可，突出重点信息。直接给出描述，不要分析过程。' }
           ]
         }],
       }),
     })
     const data = await r.json()
     if (!r.ok) throw new Error(data?.error?.message || '图片识别失败')
-    const description = data.choices?.[0]?.message?.content?.trim() || ''
+    const msg = data.choices?.[0]?.message || {}
+    // 部分推理模型将结果放在 reasoning 字段而非 content
+    const description = (msg.content || msg.reasoning || '').trim()
+      // 推理过程可能很长，取最后一段有意义的文字（第一个换行前或全部）
+      .split('\n').filter(l => l.trim()).pop() || ''
     res.json({ description })
   } catch (e) {
     apiError(res, 500, e.message)
