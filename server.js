@@ -178,6 +178,100 @@ app.post('/api/ai/chat', async (req, res) => {
 })
 
 // ════════════════════════════════════════════════════════════════════════════
+//  MEDIA  /api/media/*
+//  供微信/其他 channel 的 agent 处理本地媒体文件
+// ════════════════════════════════════════════════════════════════════════════
+
+// POST /api/media/transcribe  { filePath: "/abs/path/to/audio.wav", date? }
+// → 读取本地音频文件，调用 Whisper API 转写，返回 { text }
+app.post('/api/media/transcribe', async (req, res) => {
+  try {
+    const { filePath, date } = req.body
+    if (!filePath) return apiError(res, 400, 'filePath required')
+    if (!existsSync(filePath)) return apiError(res, 404, `文件不存在: ${filePath}`)
+    if (!validKey('OPENAI_API_KEY', 'sk-xxx'))
+      return apiError(res, 503, '未配置 OPENAI_API_KEY，无法转写语音')
+
+    const audioBuffer = readFileSync(filePath)
+    // 根据扩展名决定 mime type
+    const ext = filePath.split('.').pop()?.toLowerCase() || 'wav'
+    const mimeMap = { wav: 'audio/wav', mp3: 'audio/mpeg', ogg: 'audio/ogg', silk: 'audio/silk', m4a: 'audio/mp4' }
+    const mimeType = mimeMap[ext] || 'audio/wav'
+    const form = new FormData()
+    form.append('file', new Blob([audioBuffer], { type: mimeType }), `audio.${ext}`)
+    form.append('model', 'whisper-1')
+    form.append('language', 'zh')
+
+    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: form,
+    })
+    const data = await r.json()
+    if (!r.ok) throw new Error(data.error?.message || 'Whisper 转写失败')
+    const text = (data.text || '').trim()
+    res.json({ text })
+  } catch (e) {
+    apiError(res, 500, e.message)
+  }
+})
+
+// POST /api/media/describe  { filePath: "/abs/path/to/image.jpg" }
+// → 读取本地图片，调用视觉模型生成描述，返回 { description }
+app.post('/api/media/describe', async (req, res) => {
+  try {
+    const { filePath } = req.body
+    if (!filePath) return apiError(res, 400, 'filePath required')
+    if (!existsSync(filePath)) return apiError(res, 404, `文件不存在: ${filePath}`)
+
+    const imageBuffer = readFileSync(filePath)
+    const base64 = imageBuffer.toString('base64')
+    const ext = filePath.split('.').pop()?.toLowerCase() || 'jpg'
+    const mimeType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg'
+
+    // 优先用 openrouter，支持多视觉模型；fallback 到 openai
+    const apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY
+    if (!apiKey) return apiError(res, 503, '未配置 API key，无法识别图片')
+
+    const isOpenRouter = !!process.env.OPENROUTER_API_KEY
+    const endpoint = isOpenRouter
+      ? 'https://openrouter.ai/api/v1/chat/completions'
+      : 'https://api.openai.com/v1/chat/completions'
+    // 选择支持 vision 的模型
+    const model = isOpenRouter
+      ? (process.env.OPENROUTER_VISION_MODEL || 'qwen/qwen2.5-vl-72b-instruct:free')
+      : (process.env.OPENAI_MODEL || 'gpt-4o')
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      ...(isOpenRouter ? { 'HTTP-Referer': 'https://github.com/kayaliu/MyDiary', 'X-Title': 'MyDiary' } : {}),
+    }
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model,
+        max_tokens: 300,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } },
+            { type: 'text', text: '请用中文简短描述这张图片的内容，一两句话即可，突出重点信息。' }
+          ]
+        }],
+      }),
+    })
+    const data = await r.json()
+    if (!r.ok) throw new Error(data?.error?.message || '图片识别失败')
+    const description = data.choices?.[0]?.message?.content?.trim() || ''
+    res.json({ description })
+  } catch (e) {
+    apiError(res, 500, e.message)
+  }
+})
+
+// ════════════════════════════════════════════════════════════════════════════
 //  SIYUAN PROXY  /api/siyuan/*
 // ════════════════════════════════════════════════════════════════════════════
 app.use('/api/siyuan', async (req, res) => {
