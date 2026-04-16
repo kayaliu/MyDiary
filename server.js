@@ -105,6 +105,81 @@ app.patch('/api/data/diaries/:date', (req, res) => {
 //    qianfan    — 百度千帆（OpenAI 兼容）
 // ════════════════════════════════════════════════════════════════════════════
 
+// ── 语音转写（ASR）提供商配置表 ──────────────────────────────────────────────
+// ASR_PROVIDER=groq|siliconflow|openai 或不设置（自动检测）
+// 所有提供商均为 OpenAI /audio/transcriptions 兼容接口
+const ASR_PROVIDERS = {
+  groq: {
+    envKey: 'GROQ_API_KEY',
+    base:   'https://api.groq.com/openai/v1',
+    model:  () => process.env.GROQ_ASR_MODEL || 'whisper-large-v3-turbo',
+    note:   'Groq 免费 25h/月',
+  },
+  siliconflow: {
+    envKey: 'SILICONFLOW_API_KEY',
+    base:   'https://api.siliconflow.cn/v1',
+    model:  () => process.env.SILICONFLOW_ASR_MODEL || 'FunAudioLLM/SenseVoiceSmall',
+    note:   '硅基流动 有免费额度',
+  },
+  openai: {
+    envKey: 'OPENAI_API_KEY',
+    base:   () => process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+    model:  () => process.env.OPENAI_ASR_MODEL || 'whisper-1',
+    note:   'OpenAI Whisper 付费',
+  },
+}
+
+/**
+ * 解析语音转写请求 → 返回 { text }
+ * 自动选择 ASR 提供商：ASR_PROVIDER env > 按 key 存在顺序 > 报错
+ */
+async function callASR(audioBuffer, mimeType = 'audio/wav', filename = 'audio.wav') {
+  // 确定使用哪个 provider
+  const providerName = (process.env.ASR_PROVIDER || '').toLowerCase()
+  let cfg = ASR_PROVIDERS[providerName]
+
+  // 未指定则按优先级自动检测（每个 provider 用自己的占位符判断）
+  const ASR_PLACEHOLDERS = { GROQ_API_KEY: 'gsk_xxx', SILICONFLOW_API_KEY: 'sk-xxx', OPENAI_API_KEY: 'sk-xxx' }
+  if (!cfg) {
+    for (const [, c] of Object.entries(ASR_PROVIDERS)) {
+      if (validKey(c.envKey, ASR_PLACEHOLDERS[c.envKey] || 'xxx')) {
+        cfg = c
+        break
+      }
+    }
+  }
+
+  if (!cfg) {
+    throw new Error(
+      '未配置语音转写服务。请在 .env 中设置以下任意一个：\n' +
+      '  GROQ_API_KEY=... （推荐，免费25h/月，注册 console.groq.com）\n' +
+      '  SILICONFLOW_API_KEY=... （硅基流动，国内可用）\n' +
+      '  OPENAI_API_KEY=... （OpenAI Whisper）\n' +
+      '并可选设置 ASR_PROVIDER=groq|siliconflow|openai 指定优先级'
+    )
+  }
+
+  const apiKey = process.env[cfg.envKey]
+  if (!apiKey) throw new Error(`ASR provider 已选 ${cfg.envKey}，但该 key 未配置`)
+
+  const base = typeof cfg.base === 'function' ? cfg.base() : cfg.base
+  const model = cfg.model()
+
+  const form = new FormData()
+  form.append('file', new Blob([audioBuffer], { type: mimeType }), filename)
+  form.append('model', model)
+  form.append('language', 'zh')
+
+  const r = await fetch(`${base}/audio/transcriptions`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+    body: form,
+  })
+  const data = await r.json()
+  if (!r.ok) throw new Error(data?.error?.message || `ASR 转写失败 (${r.status})`)
+  return (data.text || '').trim()
+}
+
 // OpenAI 兼容提供商配置表
 const OPENAI_COMPAT_PROVIDERS = {
   openai: {
@@ -186,33 +261,19 @@ app.post('/api/ai/chat', async (req, res) => {
 // → 读取本地音频文件，调用 Whisper API 转写，返回 { text }
 app.post('/api/media/transcribe', async (req, res) => {
   try {
-    const { filePath, date } = req.body
+    const { filePath } = req.body
     if (!filePath) return apiError(res, 400, 'filePath required')
     if (!existsSync(filePath)) return apiError(res, 404, `文件不存在: ${filePath}`)
-    if (!validKey('OPENAI_API_KEY', 'sk-xxx'))
-      return apiError(res, 503, '未配置 OPENAI_API_KEY，无法转写语音')
 
     const audioBuffer = readFileSync(filePath)
-    // 根据扩展名决定 mime type
     const ext = filePath.split('.').pop()?.toLowerCase() || 'wav'
     const mimeMap = { wav: 'audio/wav', mp3: 'audio/mpeg', ogg: 'audio/ogg', silk: 'audio/silk', m4a: 'audio/mp4' }
     const mimeType = mimeMap[ext] || 'audio/wav'
-    const form = new FormData()
-    form.append('file', new Blob([audioBuffer], { type: mimeType }), `audio.${ext}`)
-    form.append('model', 'whisper-1')
-    form.append('language', 'zh')
 
-    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: form,
-    })
-    const data = await r.json()
-    if (!r.ok) throw new Error(data.error?.message || 'Whisper 转写失败')
-    const text = (data.text || '').trim()
+    const text = await callASR(audioBuffer, mimeType, `audio.${ext}`)
     res.json({ text })
   } catch (e) {
-    apiError(res, 500, e.message)
+    apiError(res, 503, e.message)
   }
 })
 
@@ -394,23 +455,7 @@ async function handleFeishuAudio(msg, event, date) {
     if (!audioRes.ok) throw new Error(`音频下载失败 (${audioRes.status})`)
     const audioBuffer = await audioRes.arrayBuffer()
 
-    if (!validKey('OPENAI_API_KEY', 'sk-xxx')) {
-      await sendFeishuReply(event, '🎤 收到语音，但未配置语音转写服务（需在 .env 中设置有效的 OPENAI_API_KEY）。请直接发文字记录。')
-      return
-    }
-
-    const form = new FormData()
-    form.append('file', new Blob([audioBuffer], { type: 'audio/ogg' }), 'audio.ogg')
-    form.append('model', 'whisper-1')
-    form.append('language', 'zh')
-    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: form,
-    })
-    const whisperData = await whisperRes.json()
-    if (!whisperRes.ok) throw new Error(whisperData.error?.message || 'Whisper 转写失败')
-    const text = (whisperData.text || '').trim()
+    const text = await callASR(audioBuffer, 'audio/ogg', 'audio.ogg')
     if (!text) throw new Error('转写结果为空')
 
     if (text.includes('总结日记') || text.includes('生成日记')) {
@@ -555,14 +600,22 @@ app.get('/api/health', (_req, res) => {
     storage: 'sqlite',
     configured: {
       anthropic:   validKey('ANTHROPIC_API_KEY',  'sk-ant-xxx'),
-      openai:      validKey('OPENAI_API_KEY',      'sk-xxx'),
-      deepseek:    validKey('DEEPSEEK_API_KEY',    'sk-xxx'),
-      openrouter:  validKey('OPENROUTER_API_KEY',  'sk-or-xxx'),
-      google:      validKey('GOOGLE_API_KEY',      'AIza-xxx'),
-      qianfan:     validKey('QIANFAN_API_KEY',     'your-qianfan-key'),
-      siyuan:      validKey('SIYUAN_TOKEN',        'your-siyuan-token'),
-      feishu:      validKey('FEISHU_APP_ID',       'your-feishu-app-id'),
-      wecom:       validKey('WECOM_TOKEN',         'your-wecom-token'),
+      openai:       validKey('OPENAI_API_KEY',       'sk-xxx'),
+      deepseek:     validKey('DEEPSEEK_API_KEY',     'sk-xxx'),
+      openrouter:   validKey('OPENROUTER_API_KEY',   'sk-or-xxx'),
+      google:       validKey('GOOGLE_API_KEY',        'AIza-xxx'),
+      qianfan:      validKey('QIANFAN_API_KEY',       'your-qianfan-key'),
+      groq:         validKey('GROQ_API_KEY',          'gsk_xxx'),
+      siliconflow:  validKey('SILICONFLOW_API_KEY',   'sk-xxx'),
+      siyuan:       validKey('SIYUAN_TOKEN',          'your-siyuan-token'),
+      feishu:       validKey('FEISHU_APP_ID',         'your-feishu-app-id'),
+      wecom:        validKey('WECOM_TOKEN',            'your-wecom-token'),
+      asr: (() => {
+        const placeholders = { GROQ_API_KEY: 'gsk_xxx', SILICONFLOW_API_KEY: 'sk-xxx', OPENAI_API_KEY: 'sk-xxx' }
+        for (const c of Object.values(ASR_PROVIDERS))
+          if (validKey(c.envKey, placeholders[c.envKey] || 'xxx')) return true
+        return false
+      })(),
     },
     channels: {
       feishu: `http://your-domain:${PORT}/webhook/feishu`,
